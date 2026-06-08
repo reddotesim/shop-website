@@ -2,7 +2,7 @@ import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
 
 // Routes that require authentication
-const PROTECTED_ROUTES = ['/dashboard'];
+const PROTECTED_ROUTES = ['/dashboard', '/admin'];
 
 export async function middleware(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
@@ -47,7 +47,9 @@ export async function middleware(request: NextRequest) {
 
   // Redirect logged-in users away from auth pages
   if (user && (pathname === '/login' || pathname === '/register')) {
-    return NextResponse.redirect(new URL('/dashboard', request.url));
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const dest = (adminEmail && user.email === adminEmail) ? '/admin' : '/dashboard';
+    return NextResponse.redirect(new URL(dest, request.url));
   }
 
   return supabaseResponse;

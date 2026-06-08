@@ -2,12 +2,13 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 
 export default function LoginPage() {
-  const router   = useRouter();
-  const supabase = createClient();
+  const router       = useRouter();
+  const searchParams = useSearchParams();
+  const supabase     = createClient();
 
   const [email,    setEmail]    = useState('');
   const [password, setPassword] = useState('');
@@ -19,11 +20,27 @@ export default function LoginPage() {
     setLoading(true);
     setError('');
 
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
     if (error) {
       setError(error.message);
       setLoading(false);
+      return;
+    }
+
+    // Explicit redirect param (e.g. from middleware) takes priority
+    const redirectTo = searchParams.get('redirect');
+    if (redirectTo) {
+      router.push(redirectTo);
+      router.refresh();
+      return;
+    }
+
+    // If the logged-in e-mail is the admin account, go straight to admin
+    const adminEmail = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
+    if (adminEmail && data.user?.email === adminEmail) {
+      router.push('/admin');
+      router.refresh();
       return;
     }
 
