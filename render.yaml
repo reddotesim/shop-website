@@ -1,0 +1,69 @@
+services:
+  # ── Main Next.js Web App ─────────────────────────────────────
+  - type: web
+    name: esim-shop
+    env: node
+    region: frankfurt          # closest to EU customers
+    plan: starter              # upgrade as needed
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      # These MUST be set in the Render dashboard – never commit real values!
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ESIMACCESS_API_URL
+        sync: false
+      - key: ESIMACCESS_ACCESS_CODE
+        sync: false
+      - key: SELLAUTH_API_KEY
+        sync: false
+      - key: SELLAUTH_SHOP_ID
+        sync: false
+      - key: SELLAUTH_WEBHOOK_SECRET
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_SECURE
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM_NAME
+        sync: false
+      - key: SMTP_FROM_ADDRESS
+        sync: false
+      - key: EXCHANGE_RATE_API_URL
+        sync: false
+      - key: EXCHANGE_RATE_API_KEY
+        sync: false
+      - key: NEXT_PUBLIC_APP_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+
+  # ── Daily Cron Job (tariff sync) ─────────────────────────────
+  - type: cron
+    name: esim-tariff-sync
+    env: node
+    region: frankfurt
+    schedule: "0 3 * * *"     # 03:00 UTC daily
+    buildCommand: echo "no build needed"
+    startCommand: >
+      curl -s -X GET
+      "${NEXT_PUBLIC_APP_URL}/api/cron/sync-tariffs"
+      -H "Authorization: Bearer ${CRON_SECRET}"
+    envVars:
+      - key: NEXT_PUBLIC_APP_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
