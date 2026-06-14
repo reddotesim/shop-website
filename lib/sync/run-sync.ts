@@ -30,6 +30,7 @@ import {
 import { calculateSalePrice, fetchUsdEurRate } from '@/lib/pricing';
 import { createServiceClient }                 from '@/lib/supabase/server';
 import type { EsimAccessPackage }              from '@/lib/esimaccess/types';
+import { revalidatePath }                      from 'next/cache';
 
 export interface SyncResult {
   success:      boolean;
@@ -131,6 +132,31 @@ export async function runSync(syncId = new Date().toISOString()): Promise<SyncRe
     // Use syncStartIso so deactivation via last_synced_at < syncStartIso works correctly.
     const syncedAt = new Date().toISOString();
 
+    // Load existing multi-country names from Supabase for caching & AI context
+    const existingNamingMap = new Map<string, string>();
+    try {
+      const { data: existingMulti } = await db
+        .from('tariffs')
+        .select('location_codes, country_name')
+        .eq('is_active', true);
+      
+      if (existingMulti) {
+        for (const t of existingMulti) {
+          if (Array.isArray(t.location_codes) && t.location_codes.length > 1) {
+            const sortedKey = [...t.location_codes].sort().join(',');
+            if (t.country_name) {
+              existingNamingMap.set(sortedKey, t.country_name);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[sync] Failed to load existing multi-country names:', (err as Error).message);
+    }
+
+    // Fetch AI display names if DeepSeek is configured (will only query for new combinations)
+    const aiDisplayNames = await getAiDisplayNames(packages, existingNamingMap);
+
     const rows = packages.map((pkg) => {
       const ekUsd         = priceToUsd(pkg.price);
       const salePriceEur  = calculateSalePrice(ekUsd, usdEurRate);
@@ -141,7 +167,14 @@ export async function runSync(syncId = new Date().toISOString()): Promise<SyncRe
       const isMulti       = locationCodes.length > 1;
 
       const countryCode = isMulti ? getRegionCode(locationCodes) : (locationCodes[0] ?? 'XX');
-      const countryName = getCountryName(pkg);
+      let countryName   = getCountryName(pkg);
+      if (isMulti) {
+        const sortedKey = [...locationCodes].sort().join(',');
+        const aiName = aiDisplayNames.get(sortedKey);
+        if (aiName) {
+          countryName = aiName;
+        }
+      }
       const region      = isMulti ? countryName : null;
 
       const flagEmoji = !isMulti && locationCodes.length === 1
@@ -308,6 +341,16 @@ export async function runSync(syncId = new Date().toISOString()): Promise<SyncRe
 
     console.log(`[sync] Done. packages=${packages.length} upserted=${upserted} errors=${errors} priceChanges=${proposals.length} duration=${duration}ms`);
 
+    try {
+      console.log('[sync] Triggering local cache revalidation...');
+      revalidatePath('/');
+      revalidatePath('/tariffs');
+      revalidatePath('/api/destinations');
+      console.log('[sync] Local cache revalidation triggered.');
+    } catch (revalErr) {
+      console.error('[sync] Local cache revalidation failed:', revalErr);
+    }
+
     return {
       success:      upserted > 0,
       upserted,
@@ -333,5 +376,131 @@ export async function runSync(syncId = new Date().toISOString()): Promise<SyncRe
       success: false, upserted: 0, errors: 0, total: 0, usdEurRate: 0,
       priceChanges: 0, syncId, duration_ms: Date.now() - startedAt, error: message,
     };
+  }
+}
+
+/**
+ * Call DeepSeek API to name new multi-country packages based on their covered countries.
+ * Leverages existing mappings from the database to avoid duplicate queries and maintain consistency.
+ * Returns a combined Map of sorted location keys -> customer friendly display name.
+ */
+async function getAiDisplayNames(
+  packages: any[],
+  existingNamingMap: Map<string, string>
+): Promise<Map<string, string>> {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) {
+    console.log('[AI Naming] DEEPSEEK_API_KEY not set. Using existing or default naming.');
+    return existingNamingMap;
+  }
+
+  const model = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+  
+  // 1. Identify all unique multi-country combinations and group packages under them
+  const newCombinationsToName = new Map<string, string[]>(); // sortedKey -> locationCodes
+  const examplePackageNames = new Map<string, string>(); // sortedKey -> example name (for AI context)
+
+  for (const p of packages) {
+    const location = p.location || '';
+    const codes = location ? location.split(',').map((c: string) => c.trim().toUpperCase()).filter(Boolean) : [];
+    if (codes.length > 1) {
+      const sortedKey = [...codes].sort().join(',');
+      // If we don't have a name for this combination in existing database, and haven't queued it yet, queue it
+      if (!existingNamingMap.has(sortedKey) && !newCombinationsToName.has(sortedKey)) {
+        newCombinationsToName.set(sortedKey, codes);
+        examplePackageNames.set(sortedKey, p.name || '');
+      }
+    }
+  }
+
+  // If there are no new combinations, return the existingNamingMap as is
+  if (newCombinationsToName.size === 0) {
+    console.log('[AI Naming] No new multi-country combinations found. Using cached names.');
+    return existingNamingMap;
+  }
+
+  console.log(`[AI Naming] Found ${newCombinationsToName.size} new multi-country combinations. Querying DeepSeek (${model}) for names...`);
+
+  // 2. Prepare the payload for DeepSeek
+  const payload = Array.from(newCombinationsToName.entries()).map(([key, countries]) => {
+    return {
+      combinationId: key,
+      countries,
+      exampleName: examplePackageNames.get(key) || '',
+    };
+  });
+
+  // 3. Prepare the existing context dictionary for consistency
+  const existingContext: Record<string, string> = {};
+  existingNamingMap.forEach((name, key) => {
+    existingContext[key] = name;
+  });
+
+  try {
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an expert copywriter for a premium eSIM shop. Your task is to generate beautiful, concise, customer-friendly display names for new multi-country eSIM packages based on the countries they cover. Output must be a raw JSON object mapping combinationId directly to the proposed display name (string). Do not add markdown wrapping or chat preamble, just return the JSON object.'
+          },
+          {
+            role: 'user',
+            content: `Here are the existing named multi-country combinations we already use in the shop (use these as context for naming consistency):
+${JSON.stringify(existingContext, null, 2)}
+
+Please name the following new multi-country combinations. Maintain naming consistency with the existing combinations where logical.
+Rules:
+- If it covers almost all of Europe, use 'Europe'.
+- If it covers almost all of Asia, use 'Asia'.
+- If it covers a small group of countries, combine them (e.g. 'USA & Canada', 'DACH Region', 'Scandinavia').
+- If it is global or covers many countries across continents, use 'Global'.
+- Keep names under 30 characters.
+
+Combinations to name:
+${JSON.stringify(payload, null, 2)}`
+          }
+        ],
+        temperature: 0.1,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`[AI Naming] DeepSeek API returned status ${response.status}: ${errorText}`);
+      return existingNamingMap;
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) {
+      console.error('[AI Naming] Empty response from DeepSeek API');
+      return existingNamingMap;
+    }
+
+    const nameMap = JSON.parse(content) as Record<string, string>;
+    const resultMap = new Map(existingNamingMap);
+    
+    for (const [key, name] of Object.entries(nameMap)) {
+      if (typeof name === 'string' && name.trim()) {
+        resultMap.set(key, name.trim());
+      }
+    }
+
+    console.log(`[AI Naming] Successfully named ${nameMap ? Object.keys(nameMap).length : 0} new combinations. Total cached combinations: ${resultMap.size}`);
+    return resultMap;
+  } catch (err) {
+    console.error('[AI Naming] Failed to resolve names via DeepSeek:', err);
+    return existingNamingMap;
   }
 }

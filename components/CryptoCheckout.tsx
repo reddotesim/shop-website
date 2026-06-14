@@ -31,7 +31,7 @@ const STR: Record<string, Record<string, string>> = {
   paid_sub:     { en: 'Your eSIMs are being delivered…', de: 'Deine eSIMs werden ausgeliefert…' },
   expired:      { en: 'This payment window has expired.', de: 'Dieses Zahlungsfenster ist abgelaufen.' },
   expired_sub:  { en: 'Please start a new checkout.', de: 'Bitte starte einen neuen Checkout.' },
-  exact_warn:   { en: 'The amount must match to the last digit — it is your payment ID.', de: 'Der Betrag muss bis zur letzten Stelle stimmen — er ist deine Zahlungs-ID.' },
+  exact_warn:   { en: 'Please send the exact amount to verify your payment.', de: 'Bitte sende den exakten Betrag, um deine Zahlung zu verifizieren.' },
   open_wallet:  { en: 'Open in wallet', de: 'In Wallet öffnen' },
   new_checkout: { en: 'New checkout', de: 'Neuer Checkout' },
   cancel_btn:   { en: 'Cancel Payment', de: 'Zahlung abbrechen' },
@@ -62,7 +62,10 @@ const STR: Record<string, Record<string, string>> = {
   detected_hint:     {
     en: 'You can leave this page open or close it – your order will be processed automatically as soon as the confirmation is complete.',
     de: 'Du kannst diese Seite geöffnet lassen oder schließen – deine Bestellung wird automatisch verarbeitet, sobald die Bestätigung abgeschlossen ist.'
-  }
+  },
+  auto_update_in: { en: 'Automatic update in {seconds}s…', de: 'Automatische Aktualisierung in {seconds}s…' },
+  refresh_btn:    { en: 'Refresh', de: 'Aktualisieren' },
+  refreshing:     { en: 'Refreshing…', de: 'Wird aktualisiert…' }
 };
 
 interface CoinTheme {
@@ -189,6 +192,9 @@ export function CryptoCheckout({ sessionId }: { sessionId: string }) {
   const [verifyMsg, setVerifyMsg]   = useState('');
   const [verifyMsgType, setVerifyMsgType] = useState<'success' | 'error' | ''>('');
 
+  const [countdown, setCountdown] = useState(5);
+  const [refreshing, setRefreshing] = useState(false);
+
   const poll = useCallback(async () => {
     try {
       const res = await fetch(`/api/crypto/session/${sessionId}`, { cache: 'no-store' });
@@ -254,11 +260,36 @@ export function CryptoCheckout({ sessionId }: { sessionId: string }) {
     }
   };
 
+  const handleManualRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    await poll();
+    setCountdown(5);
+    setRefreshing(false);
+  };
+
+  const status = sess ? (remaining <= 0 && sess.status === 'pending' ? 'expired' : sess.status) : 'pending';
+
   useEffect(() => {
     poll();
-    pollRef.current = setInterval(poll, 5000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [poll]);
+    if (status === 'detected') {
+      const timer = setInterval(() => {
+        setCountdown((c) => {
+          if (c <= 1) {
+            poll();
+            return 5;
+          }
+          return c - 1;
+        });
+      }, 1000);
+      pollRef.current = timer;
+      return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    } else {
+      const timer = setInterval(poll, 5000);
+      pollRef.current = timer;
+      return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    }
+  }, [poll, status]);
 
   // Local 1s countdown tick
   useEffect(() => {
@@ -276,7 +307,7 @@ export function CryptoCheckout({ sessionId }: { sessionId: string }) {
     return <div className="mx-auto max-w-md px-4 py-20 text-center text-slate-400">…</div>;
   }
 
-  const status = remaining <= 0 && sess.status === 'pending' ? 'expired' : sess.status;
+
 
   // ── Terminal states ──
   if (status === 'paid') {
@@ -387,13 +418,35 @@ export function CryptoCheckout({ sessionId }: { sessionId: string }) {
           </>
         )}
 
-        {status === 'detected' && (
-          <div className="mb-6 rounded-2xl bg-blue-50/60 border border-blue-100 p-4 text-xs text-blue-800 leading-relaxed shadow-sm">
-            <p className="font-bold mb-1 text-sm">{s('detected_title')}</p>
-            <p>{s('detected_desc')}</p>
-            <p className="mt-2 text-slate-500">{s('detected_hint')}</p>
-          </div>
-        )}
+        {status === 'detected' && (() => {
+          const pctCovered = expectedNum > 0 ? Math.min(100, Math.round((receivedNum / expectedNum) * 100)) : 0;
+          return (
+            <div className="mb-6 rounded-2xl bg-blue-50/60 border border-blue-100 p-5 text-xs text-blue-800 leading-relaxed shadow-sm">
+              <p className="font-bold mb-2 text-sm">{s('detected_title')}</p>
+              <p className="mb-4">{s('detected_desc')}</p>
+              
+              {/* Payment coverage progress indicator */}
+              <div className="mb-4 rounded-xl bg-white border border-blue-100 p-3 shadow-inner">
+                <div className="flex justify-between items-center mb-1.5 font-semibold text-[10px] uppercase tracking-wider text-slate-500">
+                  <span>Zahlungshöhe abgedeckt / Coverage</span>
+                  <span className="text-blue-600 text-xs font-bold">{pctCovered}%</span>
+                </div>
+                <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${pctCovered}%` }}
+                  />
+                </div>
+                <div className="flex justify-between items-center mt-1.5 text-[11px] text-slate-500 font-mono">
+                  <span>{receivedNum.toFixed(decimalLimit).replace(/0+$/, '').replace(/\.$/, '') || '0'} {sess.coin}</span>
+                  <span>/ {sess.cryptoAmount} {sess.coin}</span>
+                </div>
+              </div>
+              
+              <p className="text-slate-500">{s('detected_hint')}</p>
+            </div>
+          );
+        })()}
 
         {/* Live status */}
         <div className={`mt-5 rounded-xl border px-4 py-3 text-center ${theme.bgLight} ${theme.borderLight}`}>
@@ -407,6 +460,33 @@ export function CryptoCheckout({ sessionId }: { sessionId: string }) {
             </p>
           )}
         </div>
+
+        {status === 'detected' && (
+          <div className="mt-4 flex flex-col items-center gap-3">
+            <p className="text-xs text-slate-400 font-medium">
+              {s('auto_update_in').replace('{seconds}', String(countdown))}
+            </p>
+            <button
+              onClick={handleManualRefresh}
+              disabled={refreshing}
+              className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50 active:scale-[0.98] disabled:opacity-60 transition-all shadow-sm"
+            >
+              {refreshing ? (
+                <>
+                  <Spinner color="#64748B" />
+                  {s('refreshing')}
+                </>
+              ) : (
+                <>
+                  <svg className="h-3.5 w-3.5 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 7.89M21 20v-5h-.581m0 0a8.003 8.003 0 01-15.357-2" />
+                  </svg>
+                  {s('refresh_btn')}
+                </>
+              )}
+            </button>
+          </div>
+        )}
 
         {receivedNum > 0 && remainingNum > 0 && status !== 'paid' && status !== 'detected' && (
           <div className="mt-4 rounded-xl bg-red-50 border border-red-200 p-3.5 text-xs font-semibold text-red-700 leading-relaxed shadow-sm">

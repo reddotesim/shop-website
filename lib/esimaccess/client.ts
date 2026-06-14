@@ -202,10 +202,16 @@ export function detectRegion(codes: string[]): RegionInfo | null {
   let bestScore = 0;
   for (const region of REGIONS) {
     const matches = codes.filter(c => region.members.includes(c)).length;
-    const score = matches / Math.max(codes.length, region.members.length);
-    if (matches >= region.minMatch && score > bestScore) {
-      best = region;
-      bestScore = score;
+    const matchRatio = matches / codes.length;
+    
+    // To qualify as a regional eSIM, the majority of the package's countries (at least 60%) must belong to this region.
+    // This prevents Global eSIMs (e.g. covering 100+ countries) from being classified as regional.
+    if (matches >= region.minMatch && matchRatio >= 0.60) {
+      const score = matches / Math.max(codes.length, region.members.length);
+      if (score > bestScore) {
+        best = region;
+        bestScore = score;
+      }
     }
   }
   return best;
@@ -463,7 +469,7 @@ export async function allocateEsim(
         shortUrl?: string; ac?: string;
       }>;
     };
-  }>('/order/open', {
+  }>('/esim/order', {
     packageInfoList: [item],
     transactionId:   orderRef,
     amount:          item.price,   // total amount must match the sum of prices
@@ -475,20 +481,72 @@ export async function allocateEsim(
 
   // Some versions return eSIM immediately
   const esimList = orderRes.obj?.esimList;
-  if (esimList && esimList.length > 0) {
+  if (esimList && esimList.length > 0 && esimList[0].iccid) {
     return { success: true, errorCode: '0', obj: esimList[0] };
   }
 
-  // Fallback: query by orderNo
-  const queryRes = await esimRequest<EsimAccessAllocateResponse>(
-    '/order/query',
-    { orderNo: orderRes.obj.orderNo }
-  );
+  // Fallback: query by orderNo (retry up to 6 times with a 2.5s delay to allow esimaccess time to provision the profile)
+  let esim: any = null;
+  const maxRetries = 6;
+  const delayMs = 2500;
 
-  if (!queryRes.success) {
-    throw new Error(`esimaccess query failed (${queryRes.errorCode})`);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[esimaccess] Querying order ${orderRes.obj.orderNo} (attempt ${attempt}/${maxRetries})...`);
+      const queryRes = await esimRequest<{
+        success:   boolean;
+        errorCode: string;
+        obj: {
+          esimList?: Array<{
+            iccid: string; lpaCode: string; smdpAddress: string;
+            matchingId: string; qrCodeUrl: string; apn: string; msisdn: string;
+            shortUrl?: string; ac?: string;
+          }>;
+          iccid?: string; lpaCode?: string; smdpAddress?: string;
+          matchingId?: string; qrCodeUrl?: string; apn?: string; msisdn?: string;
+          shortUrl?: string;
+        };
+      }>('/esim/query', { 
+        orderNo: orderRes.obj.orderNo,
+        orderno: orderRes.obj.orderNo 
+      });
+
+      if (queryRes.success && queryRes.obj) {
+        const found = queryRes.obj.esimList?.[0] || queryRes.obj;
+        if (found && found.iccid) {
+          esim = found;
+          break; // Found the profile!
+        }
+      }
+      
+      console.log(`[esimaccess] Profile not ready yet for order ${orderRes.obj.orderNo}. ErrorCode: ${queryRes.errorCode || 'none'}`);
+    } catch (err) {
+      console.warn(`[esimaccess] Query attempt ${attempt} failed:`, (err as Error).message);
+    }
+
+    if (attempt < maxRetries) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
   }
-  return queryRes;
+
+  if (!esim || !esim.iccid) {
+    throw new Error(`esimaccess query returned no eSIM profiles after ${maxRetries} attempts`);
+  }
+
+  return {
+    success: true,
+    errorCode: '0',
+    obj: {
+      iccid: esim.iccid,
+      lpaCode: esim.lpaCode || '',
+      smdpAddress: esim.smdpAddress || '',
+      matchingId: esim.matchingId || '',
+      qrCodeUrl: esim.qrCodeUrl || '',
+      apn: esim.apn || '',
+      msisdn: esim.msisdn || '',
+      shortUrl: esim.shortUrl,
+    }
+  };
 }
 
 // ── Top-Up ───────────────────────────────────────────────────

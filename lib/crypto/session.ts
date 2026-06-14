@@ -8,6 +8,8 @@
  */
 import { createServiceClient } from '@/lib/supabase/server';
 import { getCoin, type CoinConfig } from '@/lib/crypto/coins';
+import { getCoinEurRate } from '@/lib/crypto/rates';
+import { queueAddressSync } from '@/lib/crypto/syncQueue';
 
 export interface CryptoSession {
   id:            string;
@@ -85,30 +87,76 @@ export async function createCryptoSession(opts: {
 
   const sessionId = sData.id;
 
-  // 3. Call local pure-wallet gateway to derive address and convert price to LTC
-  let walletRes: { address: string; amount_ltc: number; expires_at: string };
+  // 3. Resolve wallet address and amount. Check pool first, fall back to wallet gateway.
+  let walletRes: { address: string; amount_ltc: number; expires_at: string } | null = null;
+
   try {
-    const gatewayUrl = process.env.PURE_WALLET_URL || 'http://localhost:7777';
-    const res = await fetch(`${gatewayUrl}/api/v1/payment/create`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        amount_eur: amountEur,
-        order_id: sessionId,
-      }),
-    });
+    const { data: poolRow, error: poolError } = await db
+      .from('system_settings')
+      .select('value')
+      .eq('key', 'crypto_address_pool')
+      .maybeSingle();
 
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(errBody.error || `Gateway returned status ${res.status}`);
+    if (poolRow?.value) {
+      let pool = JSON.parse(poolRow.value) as { next_index: number; addresses: Array<{ address: string; index: number }> };
+      if (pool && Array.isArray(pool.addresses) && pool.addresses.length > 0) {
+        const nextIdx = typeof pool.next_index === 'number' ? pool.next_index : 0;
+        const entry = pool.addresses[nextIdx % pool.addresses.length];
+
+        pool.next_index = (nextIdx + 1) % pool.addresses.length;
+
+        // Save the updated pool back to system_settings
+        const { error: saveError } = await db
+          .from('system_settings')
+          .update({ value: JSON.stringify(pool) })
+          .eq('key', 'crypto_address_pool');
+
+        if (!saveError) {
+          const rate = await getCoinEurRate('litecoin');
+          const amountLtc = Math.round((amountEur / rate) * 1e8) / 1e8;
+          walletRes = {
+            address: entry.address,
+            amount_ltc: amountLtc,
+            expires_at: new Date(Date.now() + 25 * 60 * 1000).toISOString(),
+          };
+          console.log(`[Session] Rotated address ${entry.address} (index ${entry.index}) from pool for session ${sessionId}`);
+        } else {
+          console.error('[Session] Failed to save updated pool:', saveError.message);
+        }
+      }
     }
-
-    walletRes = await res.json();
   } catch (err) {
-    // Clean up created pending orders and session on failure
-    await db.from('orders').delete().in('id', opts.orderIds);
-    await db.from('crypto_sessions').delete().eq('id', sessionId);
-    throw new Error(`Krypto-Gateway-Fehler: ${(err as Error).message}`);
+    console.warn('[Session] Failed to retrieve address from pool, falling back to wallet API:', (err as Error).message);
+  }
+
+  if (!walletRes) {
+    try {
+      const gatewayUrl = process.env.PURE_WALLET_URL || 'http://localhost:7777';
+      const res = await fetch(`${gatewayUrl}/api/v1/payment/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          amount_eur: amountEur,
+          order_id: sessionId,
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || `Gateway returned status ${res.status}`);
+      }
+
+      walletRes = await res.json() as { address: string; amount_ltc: number; expires_at: string };
+    } catch (err) {
+      // Clean up created pending orders and session on failure
+      await db.from('orders').delete().in('id', opts.orderIds);
+      await db.from('crypto_sessions').delete().eq('id', sessionId);
+      throw new Error(`Krypto-Gateway-Fehler: ${(err as Error).message}`);
+    }
+  }
+
+  if (!walletRes) {
+    throw new Error('Krypto-Gateway-Fehler: Failed to resolve wallet address');
   }
 
   // 4. Update the session with derived address, ltc rate, and real expiration
@@ -127,6 +175,9 @@ export async function createCryptoSession(opts: {
   if (updateErr) {
     throw new Error(`Failed to update session address: ${updateErr.message}`);
   }
+
+  // Queue the address to be synchronized by the wallet gateway
+  await queueAddressSync(walletRes.address);
 
   // P2PKH payment URI
   const paymentUri = `litecoin:${walletRes.address}?amount=${walletRes.amount_ltc}`;
